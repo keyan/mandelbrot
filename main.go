@@ -1,70 +1,143 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
-	"runtime"
-
+	"log"
 	"math/cmplx"
-
-	"image"
-	"image/color"
-	"image/png"
 	"os"
 	"sync"
 	"time"
 
-	"gopkg.in/teh-cmc/go-sfml.v24/graphics"
-	"gopkg.in/teh-cmc/go-sfml.v24/window"
+	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 )
 
 const (
-	windowName    = "explorer"
-	maxIterations = 300
+	windowName                  = "explorer"
+	maxTicksPerSec              = 30
+	windowWidth, windowHeight   = 800, 600
+	fWindowWidth, fWindowHeight = float64(windowWidth), float64(windowHeight)
+	fWindowWidthDiv2            = fWindowWidth / 2.0
+	fWindowHeightDiv2           = fWindowHeight / 2.0
 )
 
 var (
-	windowWidth, windowHeight int = 800, 600
-	xpos, ypos                float64
-	zoom                      float64 = 1
-	renderJulia               bool
+	maxIterations      int = 300
+	fMaxIterations         = float64(maxIterations)
+	xpos, ypos         float64
+	zoom               float64 = 1
+	renderJulia        bool
+	iterationBuffer    []int
+	frameBuffer        []byte
+	lastRenderDuration time.Duration
 )
 
-// julia returns a value <= 1 representing the number of iterations
-// (relative to the max) it took for a complex number to escape to infinity.
-// If a number remains bounded then 1.0 is returned.
-func julia(z complex128) float64 {
+func init() {
+	parseFlags()
+
+	iterationBuffer = make([]int, windowWidth*windowHeight)
+	// Need 4 bytes (r,g,b,a) for each pixel which is colored per frame.
+	frameBuffer = make([]byte, windowWidth*windowHeight*4)
+}
+
+// Game is the required type from ebiten which must implement that package's
+// expected game loop functions.
+type Game struct{}
+
+// Update is called on every loop "tick". Ebiten will attempt to call this up to
+// the max allowable TPS, but due to the high cost of our rendering function
+// ticks per second will end up being much less than the 60/sec default.
+func (g *Game) Update() error {
+	if ebiten.CurrentTPS() < 4 {
+		maxIterations = 100
+		fMaxIterations = float64(maxIterations)
+	}
+
+	shiftAmt := 0.1 / zoom
+
+	if ebiten.IsKeyPressed(ebiten.KeyUp) {
+		ypos += shiftAmt
+	}
+	if ebiten.IsKeyPressed(ebiten.KeyDown) {
+		ypos -= shiftAmt
+	}
+	if ebiten.IsKeyPressed(ebiten.KeyRight) {
+		xpos += shiftAmt
+	}
+	if ebiten.IsKeyPressed(ebiten.KeyLeft) {
+		xpos -= shiftAmt
+	}
+	if ebiten.IsKeyPressed(ebiten.KeyR) {
+		xpos, ypos = 0.0, 0.0
+		zoom = 1
+	}
+	if ebiten.IsKeyPressed(ebiten.KeyEscape) {
+		os.Exit(0)
+	}
+
+	_, yScrollOffset := ebiten.Wheel()
+	if yScrollOffset < 0 {
+		zoom -= zoom * 0.03
+	} else if yScrollOffset > 0 {
+		zoom += zoom * 0.03
+	}
+	if zoom == 0 {
+		zoom = 1
+	}
+	// zoom += yScrollOffset
+
+	renderFrame()
+	return nil
+}
+
+// Draw is called on every frame and updates the ebiten screen image.
+func (g *Game) Draw(screen *ebiten.Image) {
+	screen.ReplacePixels(frameBuffer)
+	ebitenutil.DebugPrint(screen,
+		fmt.Sprintf(
+			"FPS: %0.2f\nTPS: %0.2f\nLast Render Time: %v\nZoom: %0.2f\nXpos: %0.2f\nYpos: %0.2f",
+			ebiten.CurrentFPS(),
+			ebiten.CurrentTPS(),
+			lastRenderDuration,
+			zoom, xpos, ypos,
+		),
+	)
+}
+
+// Layout changes the screen size based on users changing the window size.
+func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
+	return windowWidth, windowHeight
+}
+
+func julia(z complex128) int {
 	c := complex(0.25, 0.5)
-	i := 0
-	for ; i < maxIterations; i++ {
+	var i int
+	for i = 0; i < maxIterations; i++ {
 		if cmplx.Abs(z) > 2 {
-			break
+			return i
 		}
 		z = cmplx.Pow(z, 2) + c
 	}
 
-	return float64(maxIterations-i) / maxIterations
+	return maxIterations
 }
 
-// mandel returns a value <= 1 representing the number of iterations
-// (relative to the max) it took for a complex number to escape to infinity.
-// If a number remains bounded then 1.0 is returned.
-func mandel(z complex128) float64 {
+func mandel(z complex128) int {
 	newZ := z
-	i := 0
-	for ; i < maxIterations; i++ {
+	var i int
+	for i = 0; i < maxIterations; i++ {
 		if cmplx.Abs(newZ) > 2 {
-			break
+			return i
 		}
 		newZ = (newZ * newZ) + z
 	}
 
-	return float64(maxIterations-i) / maxIterations
+	return maxIterations
 }
 
 func parseFlags() {
-	flag.IntVar(&windowWidth, "windowWidth", windowWidth, "Width of output image")
-	flag.IntVar(&windowHeight, "windowHeight", windowHeight, "Height of output image")
 	flag.Float64Var(
 		&ypos, "y position", 0,
 		"Starting position along the imaginary axis of the complex plane")
@@ -72,93 +145,88 @@ func parseFlags() {
 		&xpos, "x position", 0,
 		"Starting position along the real axis of the complex plane")
 	flag.BoolVar(
-		&renderJulia, "julia", false, "Visualize a Julia set")
+		&renderJulia, "julia", false,
+		"Visualize a Julia set, this is really slow, don't use it")
 	flag.Parse()
+}
+
+// useNeighborFastEval uses historical iteration counts for each pixel to determine
+// if a particular pixel can be colored the same as all of it's neighbors. As long
+// as all a pixels neighbors have the same iteration result, then that result is
+// returned. Otherwise a nil error is returned.
+//
+// Use of this function allows for optimizing frame updates in exchange for lower
+// resolution rendering as the user moves.
+func useNeighborFastEval(x, y int) (int, error) {
+	left := (x - 1) + (y * windowWidth)
+	right := (x + 1) + (y * windowWidth)
+	up := x + ((y + 1) * windowWidth)
+	down := x + ((y - 1) * windowWidth)
+	if x > 0 && x < windowWidth-1 && y > 0 && y < windowHeight-1 {
+		if iterationBuffer[left] == iterationBuffer[right] &&
+			iterationBuffer[up] == iterationBuffer[down] &&
+			iterationBuffer[left] == iterationBuffer[up] {
+			return iterationBuffer[left], nil
+		}
+	}
+	return 0, errors.New("Can't use neighbors")
 }
 
 func renderFrame() {
 	wg := sync.WaitGroup{}
-	img := image.NewNRGBA(image.Rect(0, 0, windowWidth, windowHeight))
 	start := time.Now()
-	for y := 0; y <= windowHeight; y++ {
-		yi := (float64(y) - (float64(windowHeight) / 2)) / ((0.5 * zoom * float64(windowHeight)) + ypos)
+	for y := 0; y < windowHeight; y++ {
+		// Scale y from (0, windowHeight) to the plane size, depending on zoom and ypos.
+		yi := ((float64(y) - fWindowHeightDiv2) /
+			(0.5 * zoom * fWindowHeight)) + ypos
 		wg.Add(1)
-		go func(y int) {
+		go func(yi float64, y int) {
 			defer wg.Done()
-			for x := 0; x <= windowWidth; x++ {
-				xi := 1.5 * (float64(x) - (float64(windowWidth) / 2)) / ((0.5 * zoom * float64(windowWidth)) + xpos)
-				z := complex(xi, yi)
-				var escapeVal float64
-				if renderJulia {
-					escapeVal = julia(z)
+			for x := 0; x < windowWidth; x++ {
+				var iterCount int
+
+				iterations, err := useNeighborFastEval(x, y)
+				if err == nil {
+					iterCount = iterations
 				} else {
-					escapeVal = mandel(z)
+					// Scale y from (0, windowHeight) to the plane size,
+					// depending on zoom and ypos.
+					xi := (1.5 * (float64(x) - fWindowWidthDiv2) /
+						(0.5 * zoom * fWindowWidth)) + xpos
+					z := complex(xi, yi)
+					if renderJulia {
+						iterCount = julia(z)
+					} else {
+						iterCount = mandel(z)
+					}
+
 				}
-				img.Set(x, y, color.NRGBA{
-					R: uint8(escapeVal * 230),
-					G: uint8(escapeVal * 235),
-					B: uint8(escapeVal * 255),
-					A: 255,
-				})
+
+				iterationBuffer[x+(y*windowWidth)] = iterCount
+				escapeVal := (fMaxIterations - float64(iterCount)) / fMaxIterations
+				r := uint8(escapeVal * 230)
+				g := uint8(escapeVal * 235)
+				b := uint8(escapeVal * 255)
+				// Pixels must be drawn one byte at a time.
+				// Each pixel is a 32-bit color, so 4-bytes, use this to determine
+				// position in the frameBuffer.
+				p := 4 * (x + (y * windowWidth))
+				frameBuffer[p] = r
+				frameBuffer[p+1] = g
+				frameBuffer[p+2] = b
+				frameBuffer[p+3] = 0xff // Alpha is always 255
 			}
-		}(y)
+		}(yi, y)
 	}
 	wg.Wait()
-	fmt.Printf("Render time: %v\n", time.Since(start))
-
-	f, err := os.Create("output.png")
-	defer f.Close()
-	if err != nil {
-		fmt.Println("Failed to create output file")
-		os.Exit(1)
-	}
-
-	if err := png.Encode(f, img); err != nil {
-		fmt.Println("Failed to encode image")
-		os.Exit(1)
-	}
-}
-
-func init() {
-	// Required for SFML
-	runtime.LockOSThread()
+	lastRenderDuration = time.Since(start)
 }
 
 func main() {
-	parseFlags()
-	renderFrame()
-
-	// Window sizing
-	vm := window.NewSfVideoMode()
-	defer window.DeleteSfVideoMode(vm)
-	vm.SetWidth(uint(windowWidth))
-	vm.SetHeight(uint(windowHeight))
-	vm.SetBitsPerPixel(32)
-
-	// Main window
-	cs := window.NewSfContextSettings()
-	defer window.DeleteSfContextSettings(cs)
-	w := graphics.SfRenderWindow_create(vm, windowName, uint(window.SfResize|window.SfClose), cs)
-	defer window.SfWindow_destroy(w)
-
-	ev := window.NewSfEvent()
-	defer window.DeleteSfEvent(ev)
-
-	// Start the game loop
-	for window.SfWindow_isOpen(w) > 0 {
-		// Process events
-		for window.SfWindow_pollEvent(w, ev) > 0 {
-			// Close window: exit
-			if ev.GetXtype() == window.SfEventType(window.SfEvtClosed) {
-				return
-			}
-		}
-
-		renderFrame()
-		//https://www.sfml-dev.org/documentation/2.3.2/classsf_1_1Image.php#a1c2b960ea12bdbb29e80934ce5268ebf
-		// graphics.SfImageCreate()
-		graphics.SFImage_createFromPixels(
-		graphics.SfRenderWindow_clear(w, graphics.GetSfRed())
-		graphics.SfRenderWindow_display(w)
+	ebiten.SetWindowSize(windowWidth, windowHeight)
+	ebiten.SetWindowTitle(windowName)
+	ebiten.SetMaxTPS(maxTicksPerSec)
+	if err := ebiten.RunGame(&Game{}); err != nil {
+		log.Fatal(err)
 	}
 }

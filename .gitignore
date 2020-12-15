@@ -7,3 +7,4 @@ venv/
 *.out
 .DS_Store
 *.png
+mandelbrot

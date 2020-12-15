@@ -6,7 +6,6 @@ build:
 .PHONY: run
 run:
 	./mandelbrot
-	open output.png
 
 .PHONY: clean
 clean:
