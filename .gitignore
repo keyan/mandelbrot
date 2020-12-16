@@ -8,3 +8,6 @@ venv/
 .DS_Store
 *.png
 mandelbrot
+mandelbrot.wasm
+*.zip
+*.js

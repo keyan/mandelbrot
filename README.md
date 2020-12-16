@@ -12,6 +12,8 @@ Here is what the program looks like when used interactively, keep in mind the qu
 
 ## Usage
 
+A live demo is available, but the performance in a browser is ~10X worse than running directly on a computer, also give it a few seconds to load: https://keyanp.com/mandelbrot/index.html
+
 To build and run from source:
 ```
 make
@@ -39,4 +41,4 @@ I found the youtube channel [fractalmath][1] to be helpful for better understand
 [2]: https://lodev.org/cgtutor/juliamandelbrot.html
 [3]: https://ebiten.org/
 [4]: https://ebiten.org/examples
-[release]: https://github.com/keyan/mandelbrot/releases/tag/v1.0
+[release]: https://github.com/keyan/mandelbrot/releases/download/v1.0/mandelbrot.zip

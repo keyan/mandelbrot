@@ -88,10 +88,10 @@ func (g *Game) Update() error {
 
 	shiftAmt := 0.1 / zoom
 
-	if ebiten.IsKeyPressed(ebiten.KeyUp) {
+	if ebiten.IsKeyPressed(ebiten.KeyDown) {
 		ypos += shiftAmt
 	}
-	if ebiten.IsKeyPressed(ebiten.KeyDown) {
+	if ebiten.IsKeyPressed(ebiten.KeyUp) {
 		ypos -= shiftAmt
 	}
 	if ebiten.IsKeyPressed(ebiten.KeyRight) {
