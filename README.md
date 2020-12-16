@@ -1,6 +1,14 @@
 # mandelbrot
 
-Interactive Mandelbrot set visualizer. Uses the [ebiten][3] game library to run an interactive window.
+Interactive Mandelbrot set visualizer.
+
+Uses the [ebiten][3] game library to run an interactive window. To allow rendering in realtime with user input, some approximation is used to skip computations for some pixels, leading to frames improving in appearance as user input stops and re-rendering happens. 
+
+A still frame from the visualizer:
+![still](https://user-images.githubusercontent.com/6401746/102289976-e16ea800-3ef4-11eb-9559-23161ad58e88.png)
+
+Here is what the program looks like when used interactively, keep in mind the quality here is poor due to the low gif framerate and additional compression:
+![live](https://user-images.githubusercontent.com/6401746/102290677-5bebf780-3ef6-11eb-90d6-be43bcebf90d.gif)
 
 ## Usage
 
