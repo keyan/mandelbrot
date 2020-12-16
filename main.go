@@ -4,14 +4,20 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"image/color"
 	"log"
 	"math/cmplx"
 	"os"
 	"sync"
 	"time"
 
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/opentype"
+
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/examples/resources/fonts"
+	"github.com/hajimehoshi/ebiten/v2/text"
 )
 
 const (
@@ -29,9 +35,13 @@ var (
 	xpos, ypos         float64
 	zoom               float64 = 1
 	renderJulia        bool
+	fastEvalEnabled    bool
+	beginViz           bool
 	iterationBuffer    []int
 	frameBuffer        []byte
+	colors             []color.RGBA
 	lastRenderDuration time.Duration
+	mplusNormalFont    font.Face
 )
 
 func init() {
@@ -40,6 +50,22 @@ func init() {
 	iterationBuffer = make([]int, windowWidth*windowHeight)
 	// Need 4 bytes (r,g,b,a) for each pixel which is colored per frame.
 	frameBuffer = make([]byte, windowWidth*windowHeight*4)
+	colors = interpolateColors(fMaxIterations)
+
+	tt, err := opentype.Parse(fonts.MPlus1pRegular_ttf)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	const dpi = 72
+	mplusNormalFont, err = opentype.NewFace(tt, &opentype.FaceOptions{
+		Size:    24,
+		DPI:     dpi,
+		Hinting: font.HintingFull,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 // Game is the required type from ebiten which must implement that package's
@@ -50,9 +76,14 @@ type Game struct{}
 // the max allowable TPS, but due to the high cost of our rendering function
 // ticks per second will end up being much less than the 60/sec default.
 func (g *Game) Update() error {
-	if ebiten.CurrentTPS() < 4 {
-		maxIterations = 100
-		fMaxIterations = float64(maxIterations)
+	if ebiten.IsKeyPressed(ebiten.KeyEscape) {
+		os.Exit(0)
+	}
+
+	if !beginViz {
+		if ebiten.IsKeyPressed(ebiten.KeyEnter) {
+			beginViz = true
+		}
 	}
 
 	shiftAmt := 0.1 / zoom
@@ -73,14 +104,10 @@ func (g *Game) Update() error {
 		xpos, ypos = 0.0, 0.0
 		zoom = 1
 	}
-	if ebiten.IsKeyPressed(ebiten.KeyEscape) {
-		os.Exit(0)
-	}
 
-	_, yScrollOffset := ebiten.Wheel()
-	if yScrollOffset < 0 {
+	if ebiten.IsKeyPressed(ebiten.KeyO) {
 		zoom -= zoom * 0.03
-	} else if yScrollOffset > 0 {
+	} else if ebiten.IsKeyPressed(ebiten.KeyI) {
 		zoom += zoom * 0.03
 	}
 	if zoom == 0 {
@@ -94,6 +121,20 @@ func (g *Game) Update() error {
 
 // Draw is called on every frame and updates the ebiten screen image.
 func (g *Game) Draw(screen *ebiten.Image) {
+	if !beginViz {
+		text.Draw(
+			screen,
+			"Move with arrow keys\n"+
+				"Zoom in/out with 'I'/'O' keys\n"+
+				"Reset with 'R' key\n"+
+				"Exit with 'Escape'\n"+
+				"Press Enter to start\n",
+			mplusNormalFont,
+			20, 40, color.White,
+		)
+		return
+	}
+
 	screen.ReplacePixels(frameBuffer)
 	ebitenutil.DebugPrint(screen,
 		fmt.Sprintf(
@@ -147,6 +188,9 @@ func parseFlags() {
 	flag.BoolVar(
 		&renderJulia, "julia", false,
 		"Visualize a Julia set, this is really slow, don't use it")
+	flag.BoolVar(
+		&fastEvalEnabled, "fast eval", true,
+		"Use an evaluation estimation for a render speedup")
 	flag.Parse()
 }
 
@@ -158,6 +202,10 @@ func parseFlags() {
 // Use of this function allows for optimizing frame updates in exchange for lower
 // resolution rendering as the user moves.
 func useNeighborFastEval(x, y int) (int, error) {
+	if !fastEvalEnabled {
+		return 0, errors.New("Fast eval disabled")
+	}
+
 	left := (x - 1) + (y * windowWidth)
 	right := (x + 1) + (y * windowWidth)
 	up := x + ((y + 1) * windowWidth)
@@ -172,7 +220,10 @@ func useNeighborFastEval(x, y int) (int, error) {
 	return 0, errors.New("Can't use neighbors")
 }
 
+// renderFrame draws one frame of the image to frameBuffer, checking each pixel at
+// the current location and zoom level to see if it is bounded or not.
 func renderFrame() {
+	// Each row of the output is computed in parallel goroutines.
 	wg := sync.WaitGroup{}
 	start := time.Now()
 	for y := 0; y < windowHeight; y++ {
@@ -202,18 +253,27 @@ func renderFrame() {
 
 				}
 
+				// Cache result for fastEval checks.
+				// This is an intential datarace! Locking this slice slows
+				// down rendering too much because multiple goroutines need
+				// to then synchronize in order to finish this write. This
+				// hasn't crashed yet, but it probably should.
 				iterationBuffer[x+(y*windowWidth)] = iterCount
-				escapeVal := (fMaxIterations - float64(iterCount)) / fMaxIterations
-				r := uint8(escapeVal * 230)
-				g := uint8(escapeVal * 235)
-				b := uint8(escapeVal * 255)
-				// Pixels must be drawn one byte at a time.
-				// Each pixel is a 32-bit color, so 4-bytes, use this to determine
-				// position in the frameBuffer.
+
+				// Use black for high iteration counts.
+				pixelColor := color.RGBA{}
+				if iterCount < len(colors)-1 {
+					color1 := colors[iterCount]
+					color2 := colors[iterCount+1]
+					col := linearInterpolation(
+						rgbaToUint(color1), rgbaToUint(color2), uint32(iterCount))
+					pixelColor = uint32ToRgba(col)
+
+				}
 				p := 4 * (x + (y * windowWidth))
-				frameBuffer[p] = r
-				frameBuffer[p+1] = g
-				frameBuffer[p+2] = b
+				frameBuffer[p] = pixelColor.R
+				frameBuffer[p+1] = pixelColor.G
+				frameBuffer[p+2] = pixelColor.B
 				frameBuffer[p+3] = 0xff // Alpha is always 255
 			}
 		}(yi, y)
@@ -222,6 +282,7 @@ func renderFrame() {
 	lastRenderDuration = time.Since(start)
 }
 
+// main creates an ebiten game window and begins the game loop.
 func main() {
 	ebiten.SetWindowSize(windowWidth, windowHeight)
 	ebiten.SetWindowTitle(windowName)
